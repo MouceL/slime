@@ -1,7 +1,7 @@
 ---
 name: Bug report
 about: Create a report to help us improve
-title: ''
+title: 'what is this'
 labels: bug
 assignees: YonkaFang
 
