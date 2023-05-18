@@ -1,7 +1,6 @@
 package zookeeper
 
 import (
-	"bytes"
 	"encoding/json"
 	"math"
 	"net"
@@ -13,7 +12,10 @@ import (
 
 	networking "istio.io/api/networking/v1alpha3"
 
+	"slime.io/slime/modules/meshregistry/pkg/source"
 	"slime.io/slime/modules/meshregistry/pkg/util"
+
+	"slime.io/pkg/text"
 )
 
 const (
@@ -136,24 +138,30 @@ type convertedServiceEntry struct {
 	InboundEndPoints []*networking.WorkloadEntry
 }
 
-func convertServiceEntry(providers, consumers []string, service string, patchLabel bool, ignoreLabels map[string]string, gatewayMode bool) map[string]*convertedServiceEntry {
-	// TODO y: sort endpoints
+func convertServiceEntry(
+	providers, consumers []string, service string, svcPort uint32, instancePortAsSvcPort, patchLabel,
+	aggregateDubboMethods bool, ignoreLabels map[string]string, gatewayMode bool) map[string]*convertedServiceEntry {
 	serviceEntryByServiceKey := make(map[string]*convertedServiceEntry)
 	methodsByServiceKey := make(map[string]map[string]struct{})
+
 	defer func() {
 		for k, cse := range serviceEntryByServiceKey {
 			cse.methodsEqual = trimSameDubboMethodsLabel(cse.se)
-			if v := methodsByServiceKey[k]; len(v) > 0 {
-				methods := make([]string, 0, len(v))
-				for method := range v {
-					methods = append(methods, method)
-				}
-				sort.Strings(methods)
 
-				cse.methodsLabel = escapeDubboMethods(methods, nil)
+			if aggregateDubboMethods {
+				if v := methodsByServiceKey[k]; len(v) > 0 {
+					methods := make([]string, 0, len(v))
+					for method := range v {
+						methods = append(methods, method)
+					}
+					sort.Strings(methods)
+
+					cse.methodsLabel = text.EscapeLabelValues(methods)
+				}
 			}
 		}
 	}()
+
 	if providers == nil || len(providers) == 0 {
 		log.Debugf("%s no provider", service)
 		return serviceEntryByServiceKey
@@ -168,22 +176,35 @@ func convertServiceEntry(providers, consumers []string, service string, patchLab
 			continue
 		}
 
+		svcPortInUse := svcPort
 		addr, portNum, err := parseAddr(providerParts[2])
 		if err != nil {
 			log.Errorf("invalid provider ip or port %s of %s", provider, service)
 			continue
 		}
-		port := convertPort(portNum, !gatewayMode)
+		if instancePortAsSvcPort {
+			svcPortInUse = portNum
+		}
+		instPort := convertPort(svcPortInUse, portNum)
 
-		methods := map[string]struct{}{}
-		meta, ok := verifyMeta(providerParts[len(providerParts)-1], addr, patchLabel, ignoreLabels, func(method string) {
-			methods[method] = struct{}{}
-		})
+		var (
+			methods       = map[string]struct{}{}
+			methodApplier func(method string)
+		)
+		if aggregateDubboMethods {
+			methods = map[string]struct{}{}
+			methodApplier = func(method string) {
+				methods[method] = struct{}{}
+			}
+		}
+
+		meta, ok := verifyMeta(providerParts[len(providerParts)-1], addr, patchLabel, ignoreLabels, methodApplier)
 		if !ok {
 			continue
 		}
 
 		serviceKey := buildServiceKey(service, meta)
+
 		if len(methods) > 0 {
 			serviceMethods := methodsByServiceKey[serviceKey]
 			if serviceMethods == nil {
@@ -203,7 +224,7 @@ func convertServiceEntry(providers, consumers []string, service string, patchLab
 			}
 			cse = &convertedServiceEntry{se: se}
 			serviceEntryByServiceKey[serviceKey] = cse
-			// 网关模式下，服务host添加".dubbo"后缀
+			// XXX 网关模式下，服务host添加".dubbo"后缀
 			if gatewayMode {
 				se.Hosts = []string{serviceKey + DubboHostnameSuffix}
 			} else {
@@ -229,11 +250,12 @@ func convertServiceEntry(providers, consumers []string, service string, patchLab
 						log.Debugf("invalid consumer %s of %s", consumer, serviceKey)
 						cAddr = cAddr[:idx]
 					} else {
-						cPort = convertPort(portNum, !gatewayMode)
+						cPort = convertPort(portNum, portNum)
 						cAddr = addr
 					}
 				}
 
+				// XXX optimize inbound ep meta calculation
 				if meta, ok := verifyMeta(consumerParts[len(consumerParts)-1], cAddr, patchLabel, ignoreLabels, nil); ok {
 					meta = consumerMeta(meta)
 					consumerServiceKey := buildServiceKey(service, meta)
@@ -245,19 +267,27 @@ func convertServiceEntry(providers, consumers []string, service string, patchLab
 		}
 		se := cse.se
 
-		se.Endpoints = append(se.Endpoints, convertEndpoint(addr, meta, port))
+		se.Endpoints = append(se.Endpoints, convertEndpoint(addr, meta, instPort))
 
 		if _, ok := uniquePort[serviceKey]; !ok {
 			uniquePort[serviceKey] = make(map[uint32]struct{})
 		}
-		if gatewayMode {
-			if len(se.Ports) == 0 {
-				se.Ports = []*networking.Port{convertPort(80, false)}
-			}
-		} else if _, ok := uniquePort[serviceKey][port.Number]; !ok {
-			se.Ports = append(se.Ports, port)
-			uniquePort[serviceKey][port.Number] = struct{}{}
+
+		svcPortsToAdd := []uint32{svcPortInUse}
+		if svcPort != 0 && svcPort != svcPortInUse {
+			svcPortsToAdd = append(svcPortsToAdd, svcPort)
 		}
+		for _, p := range svcPortsToAdd {
+			if _, ok := uniquePort[serviceKey][p]; !ok {
+				se.Ports = append(se.Ports, convertPort(p, p))
+				uniquePort[serviceKey][p] = struct{}{}
+			}
+		}
+	}
+
+	for _, cse := range serviceEntryByServiceKey {
+		source.ApplyServicePortToEndpoints(cse.se)
+		source.RectifyServiceEntry(cse.se)
 	}
 
 	return serviceEntryByServiceKey
@@ -357,7 +387,14 @@ func verifyMeta(url string, ip string, patchLabel bool, ignoreLabels map[string]
 		case dubboParamMethods:
 			methods := strings.Split(v, ",")
 			sort.Strings(methods)
-			meta[k] = escapeDubboMethods(methods, methodApplier)
+			if methodApplier != nil {
+				for _, method := range methods {
+					if method != "" {
+						methodApplier(method)
+					}
+				}
+			}
+			meta[k] = text.EscapeLabelValues(methods)
 			continue
 		}
 
@@ -390,15 +427,11 @@ func parseDubboTag(str string, meta map[string]string) {
 	}
 }
 
-func convertPort(port uint32, nameWithPort bool) *networking.Port {
-	name := DubboPortName
-	if nameWithPort {
-		name = DubboPortName + "-" + strconv.FormatInt(int64(port), 10)
-	}
+func convertPort(svcPort, port uint32) *networking.Port {
 	return &networking.Port{
 		Protocol: NetworkProtocolDubbo,
 		Number:   port,
-		Name:     name,
+		Name:     source.PortName(NetworkProtocolDubbo, svcPort),
 	}
 }
 
@@ -450,60 +483,4 @@ func splitUrl(zkChild string) []string {
 		return nil
 	}
 	return ss
-}
-
-// escapeDubboMethods caller should ensure that methods is an ordered list
-func escapeDubboMethods(methods []string, methodApplier func(string)) string {
-	// printData2,printData1$ -> printData12-4.printData2 while hex('$') == "24"
-	isValidChar := func(b byte) bool {
-		if 'a' <= b && b <= 'z' {
-			return true
-		}
-		if 'A' <= b && b <= 'Z' {
-			return true
-		}
-		if '0' <= b && b <= '9' {
-			return true
-		}
-		if '_' == b {
-			return true
-		}
-		return false
-	}
-
-	const (
-		hextable  = "0123456789abcdef"
-		sep       = '-'
-		methodSep = '.'
-	)
-
-	buf := &bytes.Buffer{}
-	for _, method := range methods {
-		if method == "" {
-			continue
-		}
-
-		if methodApplier != nil {
-			methodApplier(method)
-		}
-
-		for idx := 0; idx < len(method); idx++ {
-			c := method[idx]
-			if isValidChar(c) {
-				buf.WriteByte(c)
-			} else {
-				buf.WriteByte(hextable[c>>4])
-				buf.WriteByte(sep)
-				buf.WriteByte(hextable[c&0x0f])
-			}
-		}
-		buf.WriteByte(methodSep)
-	}
-
-	ret := buf.String()
-	if l := len(ret); l > 0 && ret[l-1] == methodSep {
-		// remove trailing sep
-		ret = ret[:l-1]
-	}
-	return ret
 }

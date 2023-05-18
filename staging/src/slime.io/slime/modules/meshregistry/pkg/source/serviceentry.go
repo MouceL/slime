@@ -2,14 +2,21 @@ package source
 
 import (
 	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/libistio/pkg/config/event"
 	"istio.io/libistio/pkg/config/resource"
 	"istio.io/libistio/pkg/config/schema/collections"
+
 	"slime.io/slime/modules/meshregistry/pkg/util"
-	"sort"
-	"sync"
-	"time"
+)
+
+var (
+	ProtocolHTTP = "HTTP"
 )
 
 type ServiceEntryMergePortMocker struct {
@@ -96,13 +103,13 @@ func (m *ServiceEntryMergePortMocker) Handle(e event.Event) {
 	}
 
 	se := e.Resource.Message.(*networking.ServiceEntry)
-	var newPort bool
+	var newPorts []uint32
 	m.mut.Lock()
 	if m.mergeSvcPorts {
 		for _, p := range se.Ports {
 			if _, ok := m.portsCache[p.Number]; !ok {
 				m.portsCache[p.Number] = p
-				newPort = true
+				newPorts = append(newPorts, p.Number)
 			}
 		}
 	}
@@ -123,6 +130,7 @@ func (m *ServiceEntryMergePortMocker) Handle(e event.Event) {
 							Name:     fmt.Sprintf("%s-%d", portName, portNum),
 						}
 						m.portsCache[portNum] = port
+						newPorts = append(newPorts, portNum)
 						break
 					}
 				}
@@ -131,7 +139,9 @@ func (m *ServiceEntryMergePortMocker) Handle(e event.Event) {
 	}
 	m.mut.Unlock()
 
-	if newPort {
+	if len(newPorts) > 0 {
+		log.Infof("ServiceEntryMergePortMocker: serviceentry %v brings new ports %+v",
+			e.Resource.Metadata.FullName, newPorts)
 		select {
 		case m.notifyCh <- struct{}{}:
 		default:
@@ -150,4 +160,50 @@ func BuildServiceEntryEvent(kind event.Kind, se *networking.ServiceEntry, meta r
 			Message:  se,
 		},
 	}
+}
+
+// ApplyServicePortToEndpoints add svcPort->instPort mappings for those extra svc ports which are mainly from
+// MERGE-INSTANCE-PORT-TO-SVC-PORTS.
+// For example: we have two ep 1.1.1.1:8080 and 2.2.2.2:8081. After aggregating the svc ports we get http-8080: 8080
+// and http-8081: 8081, each instance has one of the corresponding ports.
+// After this function takes effect, we get: 1.1.1.1 http-8080: 8080 http-8081: 8080 and 2.2.2.2 http-8080: 8081
+// http-8081: 8081
+func ApplyServicePortToEndpoints(se *networking.ServiceEntry) {
+	if len(se.Ports) == 0 || len(se.Endpoints) == 0 {
+		return
+	}
+
+	for _, ep := range se.Endpoints {
+		if len(ep.Ports) == 0 {
+			continue
+		}
+
+		var defaultInstPort uint32
+		for _, v := range ep.Ports {
+			defaultInstPort = v
+			break
+		}
+
+		for _, svcPort := range se.Ports {
+			if _, exist := ep.Ports[svcPort.Name]; !exist {
+				ep.Ports[svcPort.Name] = defaultInstPort
+			}
+		}
+	}
+}
+
+func PortName(protocol string, num uint32) string {
+	return fmt.Sprintf("%s-%d", strings.ToLower(protocol), num)
+}
+
+func RectifyServiceEntry(se *networking.ServiceEntry) {
+	for _, strs := range [][]string{se.Addresses, se.ExportTo, se.Hosts, se.SubjectAltNames} {
+		sort.SliceStable(strs, func(i, j int) bool { return strs[i] < strs[j] })
+	}
+	sort.SliceStable(se.Endpoints, func(i, j int) bool {
+		return se.Endpoints[i].Address < se.Endpoints[j].Address
+	})
+	sort.SliceStable(se.Ports, func(i, j int) bool {
+		return se.Ports[i].Number < se.Ports[j].Number
+	})
 }

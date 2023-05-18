@@ -1,4 +1,4 @@
-module slime.io/slime/modules/bundle_example
+module slime.io/slime/modules/bundle-hango
 
 go 1.17
 
@@ -71,7 +71,7 @@ require (
 	github.com/spf13/pflag v1.0.5 // indirect
 	go.opencensus.io v0.23.0 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
-	go.uber.org/multierr v1.6.0 // indirect
+	go.uber.org/multierr v1.7.0 // indirect
 	go.uber.org/zap v1.21.0 // indirect
 	golang.org/x/net v0.4.0 // indirect
 	golang.org/x/oauth2 v0.0.0-20221014153046-6fdb5e3db783 // indirect
@@ -109,17 +109,20 @@ require (
 	sigs.k8s.io/service-apis v0.0.0-20200227172328-b9010cfacdbe // indirect
 	sigs.k8s.io/structured-merge-diff/v4 v4.1.2 // indirect
 	sigs.k8s.io/yaml v1.2.0 // indirect
+	slime.io/pkg v0.0.0-00010101000000-000000000000 // indirect
 )
 
 replace (
 	github.com/envoyproxy/go-control-plane => github.com/envoyproxy/go-control-plane v0.11.0
-	github.com/go-zookeeper/zk => github.com/slime-io/go-zk v0.0.0-20230210055653-e5ab5bf5cb30
+	github.com/go-zookeeper/zk => github.com/slime-io/go-zk v0.0.0-20230511022353-149c2ace7165
 	github.com/prometheus/common => github.com/prometheus/common v0.26.0
 
 	istio.io/api => istio.io/api v0.0.0-20211206163441-1a632586cbd4
-	istio.io/istio-mcp => github.com/slime-io/istio-mcp v0.0.0-20230105060927-109703897996
+	istio.io/istio-mcp => github.com/slime-io/istio-mcp v0.0.0-20230425025011-b36fb1902b29
 
 	istio.io/libistio => github.com/slime-io/libistio v0.0.0-20221214030325-22f5add50855
+
+	slime.io/pkg => github.com/slime-io/pkg v0.0.0-20230517042057-3fbf1159a7a7
 
 	slime.io/slime/framework => ./../../../../../../framework
 	slime.io/slime/modules/limiter => ./../limiter

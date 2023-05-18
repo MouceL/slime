@@ -17,6 +17,7 @@ require (
 	k8s.io/api v0.22.2
 	k8s.io/apimachinery v0.22.2
 	k8s.io/client-go v0.22.2
+	k8s.io/kube-openapi v0.0.0-20210421082810-95288971da7e
 	sigs.k8s.io/controller-runtime v0.10.3
 	sigs.k8s.io/yaml v1.2.0
 	slime.io/slime/framework v0.0.0-00010101000000-000000000000
@@ -24,7 +25,7 @@ require (
 
 replace (
 	istio.io/api => istio.io/api v0.0.0-20200807181912-0e773b04cfc7
-	istio.io/istio-mcp => github.com/slime-io/istio-mcp v0.0.0-20230105060927-109703897996
+	istio.io/istio-mcp => github.com/slime-io/istio-mcp v0.0.0-20230425025011-b36fb1902b29
 
 	slime.io/slime/framework => ../../../../../../framework
 )

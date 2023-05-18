@@ -36,25 +36,7 @@ type Source struct {
 	seMergePortMocker *source.ServiceEntryMergePortMocker
 
 	// common configs
-	group           string
-	patchLabel      bool
-	gatewayModel    bool
-	nsHost          bool
-	k8sDomainSuffix bool
-	allNamespaces   bool
-	namespace       string
-	namespaces      []string
-	svcPort         uint32
-	mode            string
-	delay           time.Duration
-	refreshPeriod   time.Duration
-
-	// waching configs
-	svcNameWithNs bool
-
-	// polling configs
-	defaultSvcNs string
-	resourceNs   string
+	delay time.Duration
 
 	// source cache
 	cache             map[string]*networking.ServiceEntry
@@ -71,10 +53,18 @@ type Source struct {
 
 	initedCallback func(string)
 
-	// InstanceFilers, the key of the map is the service name, and the corresponding value
-	// is the filters applied to this service. If the service name is empty, it means that
-	// all services are applicable to this filter.
-	instanceFilters source.SelectHookStore
+	// instanceFiler fitler which instance of a service should be include
+	// Updates are only allowed when the configuration is loaded or reloaded.
+	instanceFilter func(*instance) bool
+
+	reGroupInstances func(in []*instanceResp) []*instanceResp
+
+	// serviceHostAliases, the key of the map is the original host of a service, and
+	// if an original host exists in serviceHostAliases, the corresponding value will
+	// be appended to the converted ServiceEntry hosts.
+	// Updates are only allowed when the configuration is loaded or reloaded.
+	serviceHostAliases    map[string][]string
+	seMetaModifierFactory func(string) func(*resource.Metadata)
 }
 
 const (
@@ -84,7 +74,7 @@ const (
 	WATCHING         = "watching"
 	clientHeadersEnv = "NACOS_CLIENT_HEADERS"
 
-	allServiceFilter = ""
+	defaultServiceFilter = ""
 )
 
 type Option func(s *Source) error
@@ -111,30 +101,14 @@ func New(args *bootstrap.NacosSourceArgs, nsHost bool, k8sDomainSuffix bool, del
 	}
 
 	ret := &Source{
-		args: args,
-
-		namespace:       args.Namespace,
-		group:           args.Group,
-		delay:           delay,
-		refreshPeriod:   time.Duration(args.RefreshPeriod),
-		mode:            args.Mode,
-		svcNameWithNs:   args.NameWithNs,
-		started:         false,
-		gatewayModel:    args.GatewayModel,
-		patchLabel:      args.LabelPatch,
-		svcPort:         args.SvcPort,
-		nsHost:          nsHost,
-		k8sDomainSuffix: k8sDomainSuffix,
-		defaultSvcNs:    args.DefaultServiceNs,
-		resourceNs:      args.ResourceNs,
-
-		initedCallback: readyCallback,
-
+		args:              args,
+		delay:             delay,
+		started:           false,
+		initedCallback:    readyCallback,
 		cache:             make(map[string]*networking.ServiceEntry),
 		namingServiceList: cmap.New(),
 		stop:              make(chan struct{}),
 		seInitCh:          make(chan struct{}),
-
 		seMergePortMocker: svcMocker,
 	}
 
@@ -148,16 +122,13 @@ func New(args *bootstrap.NacosSourceArgs, nsHost bool, k8sDomainSuffix bool, del
 			}
 		}
 	}
+
 	if args.Mode == POLLING {
-		ret.client = NewClient(args.Address,
-			args.Username,
-			args.Password,
-			args.Namespace,
-			args.Group,
-			args.MetaKeyNamespace,
-			args.MetaKeyGroup,
-			args.AllNamespaces,
-			headers)
+		servers := args.Servers
+		if len(servers) == 0 {
+			servers = []bootstrap.NacosServer{args.NacosServer}
+		}
+		ret.client = NewClients(servers, args.MetaKeyNamespace, args.MetaKeyGroup, headers)
 	} else {
 		namingClient, err := newNamingClient(args.Address, args.Namespace, headers)
 		if err != nil {
@@ -182,7 +153,10 @@ func New(args *bootstrap.NacosSourceArgs, nsHost bool, k8sDomainSuffix bool, del
 		ret.initWg.Add(1)
 	}
 
-	ret.instanceFilters = generateInstanceFilters(args.ServicedEndpointSelectors, args.EndpointSelectors)
+	ret.instanceFilter = generateInstanceFilter(args.ServicedEndpointSelectors, args.EndpointSelectors, !args.EmptyEpSelectorsExcludeAll)
+	ret.serviceHostAliases = generateServiceHostAliases(args.ServiceHostAliases)
+	ret.seMetaModifierFactory = generateSeMetaModifierFactory(args.ServiceAdditionalMetas)
+	ret.reGroupInstances = reGroupInstances(args.InstanceMetaRelabel, args.ServiceNaming)
 
 	for _, op := range options {
 		if err := op(ret); err != nil {
@@ -193,11 +167,55 @@ func New(args *bootstrap.NacosSourceArgs, nsHost bool, k8sDomainSuffix bool, del
 	return ret, ret.cacheJson, nil
 }
 
-func generateInstanceFilters(
-	svcSel map[string][]*metav1.LabelSelector, epSel []*metav1.LabelSelector) source.SelectHookStore {
-	ret := source.NewSelectHookStore(svcSel)
-	ret[allServiceFilter] = source.NewSelectHook(epSel)
-	return ret
+func generateInstanceFilter(
+	svcSel map[string][]*metav1.LabelSelector, epSel []*metav1.LabelSelector, emptySelectorsReturn bool) func(*instance) bool {
+	selectHookStore := source.NewSelectHookStore(svcSel, emptySelectorsReturn)
+	selectHookStore[defaultServiceFilter] = source.NewSelectHook(epSel, emptySelectorsReturn)
+	return func(i *instance) bool {
+		filter := selectHookStore[i.ServiceName]
+		if filter == nil {
+			filter = selectHookStore[defaultServiceFilter]
+		}
+		return filter(i.Metadata)
+	}
+}
+
+func generateServiceHostAliases(hostAliases []*bootstrap.ServiceHostAlias) map[string][]string {
+	if len(hostAliases) != 0 {
+		serviceHostAliases := make(map[string][]string, len(hostAliases))
+		for _, ha := range hostAliases {
+			serviceHostAliases[ha.Host] = ha.Aliases
+		}
+		return serviceHostAliases
+	}
+	return nil
+}
+
+func generateSeMetaModifierFactory(additionalMetas map[string]*bootstrap.MetadataWrapper) func(string) func(*resource.Metadata) {
+	return func(s string) func(*resource.Metadata) {
+		additionalMeta, exist := additionalMetas[s]
+		if !exist || additionalMeta == nil {
+			return func(_ *resource.Metadata) { /*do nothing*/ }
+		}
+		return func(m *resource.Metadata) {
+			if len(additionalMeta.Labels) > 0 {
+				if m.Labels == nil {
+					m.Labels = make(resource.StringMap, len(additionalMeta.Labels))
+				}
+				for k, v := range additionalMeta.Labels {
+					m.Labels[k] = v
+				}
+			}
+			if len(additionalMeta.Annotations) > 0 {
+				if m.Annotations == nil {
+					m.Annotations = make(resource.StringMap, len(additionalMeta.Annotations))
+				}
+				for k, v := range additionalMeta.Annotations {
+					m.Annotations[k] = v
+				}
+			}
+		}
+	}
 }
 
 func (s *Source) markServiceEntryInitDone() {
@@ -222,20 +240,48 @@ func (s *Source) onConfig(args *bootstrap.NacosSourceArgs) {
 	var prevArgs *bootstrap.NacosSourceArgs
 	prevArgs, s.args = s.args, args
 
+	s.mut.Lock()
 	if !reflect.DeepEqual(prevArgs.EndpointSelectors, args.EndpointSelectors) ||
 		!reflect.DeepEqual(prevArgs.ServicedEndpointSelectors, args.ServicedEndpointSelectors) {
-		newInstSel := generateInstanceFilters(args.ServicedEndpointSelectors, args.EndpointSelectors)
-		s.mut.Lock()
-		s.instanceFilters = newInstSel
-		s.mut.Unlock()
+		newInstSel := generateInstanceFilter(args.ServicedEndpointSelectors, args.EndpointSelectors, !args.EmptyEpSelectorsExcludeAll)
+		s.instanceFilter = newInstSel
 	}
+
+	if !reflect.DeepEqual(prevArgs.ServiceHostAliases, args.ServiceHostAliases) {
+		newSvcHostAliases := generateServiceHostAliases(args.ServiceHostAliases)
+		s.serviceHostAliases = newSvcHostAliases
+	}
+
+	if !reflect.DeepEqual(prevArgs.ServiceAdditionalMetas, args.ServiceAdditionalMetas) {
+		newSeModifierFactory := generateSeMetaModifierFactory(args.ServiceAdditionalMetas)
+		s.seMetaModifierFactory = newSeModifierFactory
+	}
+
+	if !reflect.DeepEqual(prevArgs.InstanceMetaRelabel, args.InstanceMetaRelabel) ||
+		!reflect.DeepEqual(prevArgs.ServiceNaming, args.ServiceNaming) {
+		newReGroupInstances := reGroupInstances(args.InstanceMetaRelabel, args.ServiceNaming)
+		s.reGroupInstances = newReGroupInstances
+	}
+	s.mut.Unlock()
 }
 
-func (s *Source) getInstanceFilters() source.SelectHookStore {
+func (s *Source) getInstanceFilters() func(*instance) bool {
+	s.mut.RLock()
+	defer s.mut.RUnlock()
+	return s.instanceFilter
+}
+
+func (s *Source) getServiceHostAlias() map[string][]string {
 	s.mut.RLock()
 	defer s.mut.RUnlock()
 
-	return s.instanceFilters
+	return s.serviceHostAliases
+}
+
+func (s *Source) getSeMetaModifierFactory() func(string) func(*resource.Metadata) {
+	s.mut.RLock()
+	defer s.mut.RUnlock()
+	return s.seMetaModifierFactory
 }
 
 func (s *Source) cacheJson(w http.ResponseWriter, _ *http.Request) {
@@ -247,7 +293,7 @@ func (s *Source) cacheJson(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(b)
 }
 
-func buildEvent(kind event.Kind, item *networking.ServiceEntry, service, resourceNs string) (event.Event, error) {
+func buildEvent(kind event.Kind, item *networking.ServiceEntry, service, resourceNs string, metaModifier func(meta *resource.Metadata)) (event.Event, error) {
 	se := util.CopySe(item)
 	items := strings.Split(service, ".")
 	ns := resourceNs
@@ -264,7 +310,9 @@ func buildEvent(kind event.Kind, item *networking.ServiceEntry, service, resourc
 		FullName:    resource.FullName{Name: resource.LocalName(service), Namespace: resource.Namespace(ns)},
 		Annotations: map[string]string{},
 	}
-
+	if metaModifier != nil {
+		metaModifier(&meta)
+	}
 	return source.BuildServiceEntryEvent(kind, se, meta), nil
 }
 
@@ -284,7 +332,7 @@ func (s *Source) Start() {
 	}
 
 	go func() {
-		if s.mode == POLLING {
+		if s.args.Mode == POLLING {
 			go s.Polling()
 		} else {
 			go s.Watching()
@@ -315,4 +363,105 @@ func printEps(eps []*networking.WorkloadEntry) string {
 		ips = append(ips, ep.Address)
 	}
 	return strings.Join(ips, ",")
+}
+
+func reGroupInstances(rl *bootstrap.InstanceMetaRelabel,
+	c *bootstrap.ServiceNameConverter) func(in []*instanceResp) []*instanceResp {
+	if rl == nil && c == nil {
+		return nil
+	}
+
+	var instanceRelabel func(inst *instance) = func(inst *instance) { /*do nothing*/ }
+	if rl != nil {
+		var relabelFuncs []func(inst *instance)
+		for _, relabel := range rl.Items {
+			f := func(item *bootstrap.InstanceMetaRelabelItem) func(inst *instance) {
+				return func(inst *instance) {
+					if len(inst.Metadata) == 0 ||
+						item.Key == "" || item.TargetKey == "" {
+						return
+					}
+					v, exist := inst.Metadata[item.Key]
+					if !exist {
+						return
+					} else {
+						if nv, exist := item.ValuesMapping[v]; exist {
+							v = nv
+						}
+					}
+					if _, exist := inst.Metadata[item.TargetKey]; !exist || item.Overwirte {
+						inst.Metadata[item.TargetKey] = v
+					}
+				}
+			}(relabel)
+			relabelFuncs = append(relabelFuncs, f)
+		}
+		instanceRelabel = func(inst *instance) {
+			for _, f := range relabelFuncs {
+				f(inst)
+			}
+		}
+	}
+
+	var instanceDom func(inst *instance) string = func(inst *instance) string { return inst.ServiceName }
+	if c != nil {
+		var substrFuncs []func(inst *instance) string
+		for _, item := range c.Items {
+			var substrF func(inst *instance) string
+			switch item.Kind {
+			case bootstrap.InstanceBasicInfoKind:
+				switch item.Value {
+				case bootstrap.InstanceBasicInfoSvc:
+					substrF = func(inst *instance) string { return inst.ServiceName }
+				case bootstrap.InstanceBasicInfoIP:
+					substrF = func(inst *instance) string { return inst.Ip }
+				case bootstrap.InstanceBasicInfoPort:
+					substrF = func(inst *instance) string { return fmt.Sprintf("%d", inst.Port) }
+				}
+			case bootstrap.InstanceMetadataKind:
+				substrF = func(meta string) func(inst *instance) string {
+					return func(inst *instance) string {
+						if inst.Metadata == nil {
+							return ""
+						}
+						return inst.Metadata[meta]
+					}
+				}(item.Value)
+			case bootstrap.StaticKind:
+				substrF = func(staticValue string) func(inst *instance) string {
+					return func(inst *instance) string { return staticValue }
+				}(item.Value)
+			}
+			substrFuncs = append(substrFuncs, substrF)
+		}
+		instanceDom = func(inst *instance) string {
+			subs := make([]string, 0, len(c.Items))
+			for _, f := range substrFuncs {
+				subs = append(subs, f(inst))
+			}
+			svcName := strings.Join(subs, c.Sep)
+			// overwrite the original service name
+			inst.ServiceName = svcName
+			return svcName
+		}
+	}
+
+	return func(in []*instanceResp) []*instanceResp {
+		m := map[string][]*instance{}
+		for _, ir := range in {
+			for _, host := range ir.Hosts {
+				instanceRelabel(host)
+				dom := instanceDom(host)
+				m[dom] = append([]*instance(m[dom]), host)
+			}
+		}
+		out := make([]*instanceResp, 0, len(m))
+		for dom, hosts := range m {
+			out = append(out, &instanceResp{
+				Dom:   dom,
+				Hosts: hosts,
+			})
+		}
+		return out
+	}
 }

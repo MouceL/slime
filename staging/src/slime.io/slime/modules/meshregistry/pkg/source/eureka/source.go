@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/libistio/pkg/config/event"
 	"istio.io/libistio/pkg/config/resource"
@@ -24,20 +24,9 @@ import (
 var log = model.ModuleLog.WithField(frameworkmodel.LogFieldKeyPkg, "eureka")
 
 type Source struct {
-	// worker        *util.Worker
-	delay         time.Duration
-	refreshPeriod time.Duration
+	args *bootstrap.EurekaSourceArgs
 
-	svcPort uint32
-
-	defaultSvcNs string
-	resourceNs   string
-
-	gatewayModel    bool
-	patchLabel      bool
-	nsHost          bool
-	k8sDomainSuffix bool
-	nsfEureka       bool
+	delay time.Duration
 
 	initedCallback func(string)
 	handlers       []event.Handler
@@ -80,18 +69,14 @@ func New(args *bootstrap.EurekaSourceArgs, delay time.Duration, readyCallback fu
 			})
 	}
 
+	if !args.InstancePortAsSvcPort && args.SvcPort == 0 {
+		return nil, nil, fmt.Errorf("SvcPort == 0 while InstancePortAsSvcPort false is not permitted")
+	}
+
 	ret := &Source{
-		delay:           delay,
-		refreshPeriod:   time.Duration(args.RefreshPeriod),
-		started:         false,
-		gatewayModel:    args.GatewayModel,
-		patchLabel:      args.LabelPatch,
-		svcPort:         args.SvcPort,
-		nsHost:          args.NsHost,
-		k8sDomainSuffix: args.K8sDomainSuffix,
-		defaultSvcNs:    args.DefaultServiceNs,
-		resourceNs:      args.ResourceNs,
-		nsfEureka:       args.NsfEureka,
+		args:    args,
+		delay:   delay,
+		started: false,
 
 		initedCallback: readyCallback,
 
@@ -144,7 +129,9 @@ func (s *Source) refresh() {
 		log.Errorf("get eureka app failed: " + err.Error())
 		return
 	}
-	newServiceEntryMap, err := ConvertServiceEntryMap(apps, s.defaultSvcNs, s.gatewayModel, s.patchLabel, s.svcPort, s.nsHost, s.k8sDomainSuffix, s.nsfEureka)
+	newServiceEntryMap, err := ConvertServiceEntryMap(
+		apps, s.args.DefaultServiceNs, s.args.GatewayModel, s.args.LabelPatch, s.args.SvcPort,
+		s.args.InstancePortAsSvcPort, s.args.NsHost, s.args.K8sDomainSuffix, s.args.NsfEureka)
 	if err != nil {
 		log.Errorf("convert eureka servceentry map failed: " + err.Error())
 		return
@@ -155,7 +142,7 @@ func (s *Source) refresh() {
 			// DELETE, set ep size to zero
 			delete(s.cache, service)
 			oldEntry.Endpoints = make([]*networking.WorkloadEntry, 0)
-			if event, err := buildEvent(event.Updated, oldEntry, service, s.resourceNs); err == nil {
+			if event, err := buildEvent(event.Updated, oldEntry, service, s.args.ResourceNs); err == nil {
 				log.Infof("delete(update) eureka se, hosts: %s ,ep: %s ,size : %d ", oldEntry.Hosts[0], printEps(oldEntry.Endpoints), len(oldEntry.Endpoints))
 				for _, h := range s.handlers {
 					h.Handle(event)
@@ -168,17 +155,17 @@ func (s *Source) refresh() {
 		if oldEntry, ok := s.cache[service]; !ok {
 			// ADD
 			s.cache[service] = newEntry
-			if event, err := buildEvent(event.Added, newEntry, service, s.resourceNs); err == nil {
+			if event, err := buildEvent(event.Added, newEntry, service, s.args.ResourceNs); err == nil {
 				log.Infof("add eureka se, hosts: %s ,ep: %s, size: %d ", newEntry.Hosts[0], printEps(newEntry.Endpoints), len(newEntry.Endpoints))
 				for _, h := range s.handlers {
 					h.Handle(event)
 				}
 			}
 		} else {
-			if !reflect.DeepEqual(oldEntry, newEntry) {
+			if !proto.Equal(oldEntry, newEntry) {
 				// UPDATE
 				s.cache[service] = newEntry
-				if event, err := buildEvent(event.Updated, newEntry, service, s.resourceNs); err == nil {
+				if event, err := buildEvent(event.Updated, newEntry, service, s.args.ResourceNs); err == nil {
 					log.Infof("update eureka se, hosts: %s, ep: %s, size: %d ", newEntry.Hosts[0], printEps(newEntry.Endpoints), len(newEntry.Endpoints))
 					for _, h := range s.handlers {
 						h.Handle(event)
@@ -247,7 +234,7 @@ func (s *Source) Start() {
 
 	go func() {
 		time.Sleep(s.delay)
-		ticker := time.NewTicker(s.refreshPeriod)
+		ticker := time.NewTicker(time.Duration(s.args.RefreshPeriod))
 		defer ticker.Stop()
 		for {
 			select {

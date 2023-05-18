@@ -106,21 +106,98 @@ type SourceArgs struct {
 	GatewayModel  bool          `json:"GatewayModel,omitempty"`
 	// patch instances label
 	LabelPatch bool `json:"LabelPatch,omitempty"`
-	// svc port for services
-	SvcPort uint32 `json:"SvcPort,omitempty"`
+	// svc port for services, 0 will be ignored
+	SvcPort               uint32 `json:"SvcPort,omitempty"`               // XXX
+	InstancePortAsSvcPort bool   `json:"InstancePortAsSvcPort,omitempty"` // TODO
 	// if empty, those endpoints with ns attr will be aggregated into a no-ns service like "foo"
 	DefaultServiceNs string `json:"DefaultServiceNs,omitempty"`
 	ResourceNs       string `json:"ResourceNs,omitempty"`
 	// A list of selectors that specify the set of service instances to be processed,
 	// configured in the same way as the k8s label selector.
 	EndpointSelectors []*metav1.LabelSelector `json:"EndpointSelectors,omitempty"`
-	// Endpoint selectors for specific service, the key of the map is the service name
+	// Endpoint selectors for specific service, the key of the map is the service name.
+	// If a service matched a ServicedEndpointSelector the source scoped EndpointSelectors should be ignore.
 	ServicedEndpointSelectors map[string][]*metav1.LabelSelector `json:"ServicedEndpointSelectors,omitempty"`
+	// EmptyEpSelectorsExcludeAll if set to true, when no ep selectors are configured, the source should exclude all eps.
+	EmptyEpSelectorsExcludeAll bool `json:"EmptyEpSelectorsExcludeAll,omitempty"`
 
 	MockServiceName              string `json:"MockServiceName,omitempty"`
 	MockServiceEntryName         string `json:"MockServiceEntryName,omitempty"`
 	MockServiceMergeInstancePort bool   `json:"MockServiceMergeInstancePort,omitempty"`
 	MockServiceMergeServicePort  bool   `json:"MockServiceMergeServicePort,omitempty"`
+
+	// ServiceNaming is used to reassign the service to which the instance belongs
+	ServiceNaming *ServiceNameConverter `json:"ServiceNaming,omitempty"`
+	// ServiceHostAliases allows configuring additional aliases for the specified service host
+	ServiceHostAliases []*ServiceHostAlias `json:"ServiceHostAliases,omitempty"`
+	// ServiceAdditionalMetas allows configuring additional metadata for the specified service when converting to a ServiceEntry
+	ServiceAdditionalMetas map[string]*MetadataWrapper `json:"ServiceAdditionalMetas,omitempty"`
+	// InstanceMetaRelabel is used to adjust the metadata of the instance.
+	// Note that ServiceNaming may refer to instance metadata, the InstanceMetaRelabel needs to be processed before ServiceNaming
+	InstanceMetaRelabel *InstanceMetaRelabel `json:"InstanceMetaRelabel,omitempty"`
+}
+
+type MetadataWrapper struct {
+	Annotations map[string]string `json:"Annotations,omitempty"`
+	Labels      map[string]string `json:"Labels,omitempty"`
+}
+
+// ServiceHostAlias includes the original host and all aliases of the original host
+type ServiceHostAlias struct {
+	Host    string   `json:"Host,omitempty"`
+	Aliases []string `json:"Aliases,omitempty"`
+}
+
+// ServiceNameConverter configures the service name of an instance,
+// using Seq to connect the substring configured by each item.
+type ServiceNameConverter struct {
+	Sep   string              `json:"Sep,omitempty"`
+	Items []ServiceNamingItem `json:"Items,omitempty"`
+}
+
+type ServiceNameItemKind string
+
+var (
+	InstanceBasicInfoKind ServiceNameItemKind = "$"
+	InstanceMetadataKind  ServiceNameItemKind = "meta"
+	StaticKind            ServiceNameItemKind = "static"
+
+	InstanceBasicInfoSvc  string = "service"
+	InstanceBasicInfoIP   string = "ip"
+	InstanceBasicInfoPort string = "port"
+)
+
+// ServiceNamingItem configure how a service name substring is generated.
+// The Kind field indicates the data source of the substring and
+// configurable values are `$`, `static` and `meta`.
+//   - `$`: basic information of the instance, supports `service`(the original service name of the instance),
+//     `ip`(the instance ip), `port`(the instance port).
+//   - `meta`: metadata of the instance, the value of the Value field is the extracted key specified in the metadata.
+//   - `static`: static configuration, directly using the value of the Value field.
+type ServiceNamingItem struct {
+	Kind  ServiceNameItemKind `json:"Kind,omitempty"`
+	Value string              `json:"Value,omitempty"`
+}
+
+// InstanceMetaRelabel is used to configure how to adjust the metadata of the instance.
+type InstanceMetaRelabel struct {
+	// Items is the InstanceMetaRelabelItem configuration list, which is executed sequentially,
+	// which means that the subsequent items will be processed on the results of the previous items.
+	Items []*InstanceMetaRelabelItem `json:"Items,omitempty"`
+}
+
+// InstanceMetaRelabelItem represents an item used for relabeling instance metadata.
+type InstanceMetaRelabelItem struct {
+	// The key that currently exists in the instance metadata.
+	Key string `json:"Key,omitempty"`
+	// TargetKey is the new key to be added to the instance metadata based on the original key.
+	TargetKey string `json:"TargetKey,omitempty"`
+	// Whether to overwrite the value of the TargetKey if it already exists in the instance metadata.
+	Overwirte bool `json:"Overwirte,omitempty"`
+	// ValuesMapping is a map that associates values of the Key to values of the TargetKey.
+	// If the Key's value is found in the map, the corresponding value is used for the TargetKey.
+	// If not, the original value is used for the TargetKey.
+	ValuesMapping map[string]string `json:"ValuesMapping,omitempty"`
 }
 
 type K8SSourceArgs struct {
@@ -159,6 +236,7 @@ type ZookeeperSourceArgs struct {
 	TrimDubboRemoveDepInterval util.Duration `json:"TrimDubboRemoveDepInterval,omitempty"`
 	// specify how to map `app` to label key:value pair
 	DubboWorkloadAppLabel string `json:"DubboWorkloadAppLabel,omitempty"`
+	AggregateDubboMethods bool   `json:"AggregateDubboMethods,omitempty"` // XXX totally remove this feature?
 
 	// mcp configs
 }
@@ -197,36 +275,54 @@ func (eurekaArgs *EurekaSourceArgs) Validate() error {
 
 type NacosSourceArgs struct {
 	SourceArgs
-
-	Address []string `json:"Address,omitempty"`
+	NacosServer
 	// nacos mode for get nacos info
 	Mode string `json:"Mode,omitempty"`
-	// namespace value for nacos client
-	Namespace string `json:"Namespace,omitempty"`
-	// group value for nacos client
-	Group string `json:"Group,omitempty"`
 	// nacos service name is like name.ns
 	NameWithNs bool `json:"NameWithNs,omitempty"`
 	// need k8sDomainSuffix in Host
 	K8sDomainSuffix bool `json:"K8SDomainSuffix,omitempty"`
 	// need ns in Host
 	NsHost bool `json:"NsHost,omitempty"`
+	// If set, namespace and group information will be injected into the ep's metadata using the set key.
+	MetaKeyGroup     string        `json:"MetaKeyGroup,omitempty"`
+	MetaKeyNamespace string        `json:"MetaKeyNamespace,omitempty"`
+	Servers          []NacosServer `json:"Servers,omitempty"`
+}
+
+type NacosServer struct {
+	// addresses of the nacos servers
+	Address []string `json:"Address,omitempty"`
+	// namespace value for nacos client
+	Namespace string `json:"Namespace,omitempty"`
+	// group value for nacos client
+	Group string `json:"Group,omitempty"`
 	// username and password for nacos auth
 	Username string `json:"Username,omitempty"`
 	Password string `json:"Password,omitempty"`
 	// fetch services from all namespaces, only support Polling mode
 	AllNamespaces bool `json:"AllNamespaces,omitempty"`
-	//  If set, namespace and group information will be injected into the ep's metadata using the set key.
-	MetaKeyGroup     string `json:"MetaKeyGroup,omitempty"`
-	MetaKeyNamespace string `json:"MetaKeyNamespace,omitempty"`
+}
+
+func (nacosServer *NacosServer) Validate() error {
+	if len(nacosServer.Address) == 0 {
+		return errors.New("nacos server address must be set")
+	}
+	return nil
 }
 
 func (nacosArgs *NacosSourceArgs) Validate() error {
 	if !nacosArgs.Enabled {
 		return nil
 	}
-	if len(nacosArgs.Address) == 0 {
-		return errors.New("nacos server address must be set when nacos source is enabled")
+	if len(nacosArgs.Servers) == 0 {
+		return nacosArgs.NacosServer.Validate()
+	}
+	for _, server := range nacosArgs.Servers {
+		err := server.Validate()
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -261,7 +357,7 @@ type K8SArgs struct {
 
 func NewRegistryArgs() *RegistryArgs {
 	a := *DefaultArgs()
-	return &RegistryArgs{
+	ret := &RegistryArgs{
 		Args:    a,
 		RevCrds: "sidecars,destinationrules,envoyfilters,gateways,virtualservices",
 		Mcp: &McpArgs{
@@ -283,9 +379,10 @@ func NewRegistryArgs() *RegistryArgs {
 		},
 		ZookeeperSource: &ZookeeperSourceArgs{
 			SourceArgs: SourceArgs{
-				RefreshPeriod: util.Duration(10 * time.Second),
-				LabelPatch:    true,
-				ResourceNs:    "dubbo",
+				RefreshPeriod:         util.Duration(10 * time.Second),
+				LabelPatch:            true,
+				ResourceNs:            "dubbo",
+				InstancePortAsSvcPort: true,
 			},
 			IgnoreLabel:                 []string{"pid", "timestamp", "dubbo"},
 			Mode:                        "polling",
@@ -299,9 +396,10 @@ func NewRegistryArgs() *RegistryArgs {
 		},
 		EurekaSource: &EurekaSourceArgs{
 			SourceArgs: SourceArgs{
-				RefreshPeriod: util.Duration(30 * time.Second),
-				LabelPatch:    true,
-				SvcPort:       80,
+				RefreshPeriod:         util.Duration(30 * time.Second),
+				LabelPatch:            true,
+				SvcPort:               80,
+				InstancePortAsSvcPort: true,
 				// should set it to "xx" explicitly to get the same behaviour as before("foo.eureka")
 				DefaultServiceNs: "",
 				ResourceNs:       "eureka",
@@ -311,15 +409,18 @@ func NewRegistryArgs() *RegistryArgs {
 		},
 		NacosSource: &NacosSourceArgs{
 			SourceArgs: SourceArgs{
-				RefreshPeriod:    util.Duration(30 * time.Second),
-				LabelPatch:       true,
-				SvcPort:          80,
-				DefaultServiceNs: "",
-				ResourceNs:       "nacos",
+				RefreshPeriod:         util.Duration(30 * time.Second),
+				LabelPatch:            true,
+				SvcPort:               80,
+				InstancePortAsSvcPort: true,
+				DefaultServiceNs:      "",
+				ResourceNs:            "nacos",
 			},
 			Mode:            "watching",
 			K8sDomainSuffix: true,
 			NsHost:          true,
 		},
 	}
+
+	return ret
 }

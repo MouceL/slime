@@ -17,4 +17,6 @@ type Result struct {
 type Source interface {
 	QueryMetric(queryMap QueryMap) (Metric, error)
 	Start() error
+	Reset(info string) error
+	Fullfill(map[string]map[string]string) error
 }

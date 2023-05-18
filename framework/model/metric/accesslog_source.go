@@ -3,6 +3,7 @@ package metric
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	service_accesslog "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	log "github.com/sirupsen/logrus"
@@ -88,7 +89,7 @@ func (s *AccessLogSource) QueryMetric(queryMap QueryMap) (Metric, error) {
 					Value: convertor.CacheResultCopy()[meta],
 				}
 				metric[meta] = append(metric[meta], result)
-				log.Debugf("add metric from accesslog %+v", result)
+				log.Debugf("%s add metric from accesslog %+v", meta, result)
 			}
 		}
 
@@ -96,4 +97,60 @@ func (s *AccessLogSource) QueryMetric(queryMap QueryMap) (Metric, error) {
 
 	log.Debugf("successfully get metric from accesslog")
 	return metric, nil
+}
+
+func (s *AccessLogSource) Reset(info string) error {
+	parts := strings.Split(info, "/")
+	ns, name := parts[0], parts[1]
+
+	for _, convertor := range s.convertors {
+		convertor.convertorLock.Lock()
+
+		// reset ns/name
+		for k, _ := range convertor.cacheResult {
+			// it will reset all svf in ns if svc is empty
+			if name == "" {
+				if ns == strings.Split(k, "/")[0] {
+					convertor.cacheResult[k] = map[string]string{}
+				}
+			} else {
+				if k == info {
+					convertor.cacheResult[k] = map[string]string{}
+				}
+			}
+		}
+
+		// sync to cacheResultCopy
+		newCacheResultCopy := make(map[string]map[string]string)
+		for meta, value := range convertor.cacheResult {
+			tmpValue := make(map[string]string)
+			for k, v := range value {
+				tmpValue[k] = v
+			}
+			newCacheResultCopy[meta] = tmpValue
+		}
+		convertor.cacheResultCopy = newCacheResultCopy
+
+		convertor.convertorLock.Unlock()
+	}
+
+	return nil
+}
+
+func (s *AccessLogSource) Fullfill(cache map[string]map[string]string) error {
+
+	for _, convertor := range s.convertors {
+		convertor.convertorLock.Lock()
+		for meta, value := range cache {
+			convertor.cacheResult[meta] = value
+			tmpValue := make(map[string]string)
+			for k, v := range value {
+				tmpValue[k] = v
+			}
+
+			convertor.cacheResultCopy[meta] = tmpValue
+		}
+		convertor.convertorLock.Unlock()
+	}
+	return nil
 }

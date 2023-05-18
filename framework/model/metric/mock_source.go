@@ -17,3 +17,11 @@ func (s *MockSource) QueryMetric(queryMap QueryMap) (Metric, error) {
 	}
 	return metric, nil
 }
+
+func (s *MockSource) Reset(info string) error {
+	return nil
+}
+
+func (s *MockSource) Fullfill(cache map[string]map[string]string) error {
+	return nil
+}
