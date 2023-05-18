@@ -1,20 +1,20 @@
 ---
-name: Bug report
-about: Create a report to help us improve
+name: 问题报告
+about: 向slime开发者报告任何存在的问题
 title: ''
 labels: bug
-assignees: YonkaFang
-
+assignees: MouceL
 ---
 
-**Bug description**
+**问题描述**
 
-**Affected sub-moudle (please put an X in all that apply)**
+**影响的子模块(在下面列表中打'X')**
 
-- [ ] Configuration Lazy Loading
-- [ ] Http Plugin Management
-- [ ] Adaptive Ratelimit
-- [ ] Meshregistry
-- [ ] Slime Boot
-- 
-**Steps to reproduce the bug**
+- [ ] 配置懒加载
+- [ ] 插件管理
+- [ ] 智能限流
+- [ ] 注册仓库
+- [ ] 安装Boot
+
+**重现问题的步骤**
+

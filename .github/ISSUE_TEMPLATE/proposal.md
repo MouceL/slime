@@ -1,19 +1,19 @@
 ---
-name: Proposal
-about: user's proposal about slime
+name: 提案
+about: 用户的提案
 title: ''
 labels: 'proposal'
-assignees: YonkaFang
-
+assignees: MouceL
 ---
-**your proposal about which sub-moudle (please put an X in all that apply)**
 
-- [ ] Configuration Lazy Loading
-- [ ] Http Plugin Management
-- [ ] Adaptive Ratelimit
-- [ ] Meshregistry
-- [ ] Slime Boot
+**影响的子模块(在下面列表中打'X')**
 
----
-**your proposal**
+- [ ] 配置懒加载
+- [ ] 插件管理
+- [ ] 智能限流
+- [ ] 注册仓库
+- [ ] 安装Boot
 
+**问题背景**
+
+**您的提案内容**
