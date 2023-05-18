@@ -11,9 +11,10 @@ assignees: YonkaFang
 
 **Affected sub-moudle (please put an X in all that apply)**
 
-[ ] Configuration Lazy Loading
-[ ] Http Plugin Management
-[ ] Adaptive Ratelimit
-[ ] Slime Boot
-
+- [ ] Configuration Lazy Loading
+- [ ] Http Plugin Management
+- [ ] Adaptive Ratelimit
+- [ ] Meshregistry
+- [ ] Slime Boot
+- 
 **Steps to reproduce the bug**
